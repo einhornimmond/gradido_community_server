@@ -1,0 +1,21 @@
+CREATE TABLE `login_users` (
+  `id` int(10) unsigned NOT NULL AUTO_INCREMENT,
+  `email` varchar(191) NOT NULL,
+  `first_name` varchar(150) NOT NULL,
+  `last_name` varchar(255) DEFAULT '',
+  `username` varchar(255) DEFAULT '',
+  `description` text DEFAULT '',
+  `password` bigint(20) unsigned DEFAULT 0,
+  `pubkey` binary(32) DEFAULT NULL,
+  `privkey` binary(80) DEFAULT NULL,
+  `email_hash` binary(32) DEFAULT NULL,
+  `created` datetime NOT NULL DEFAULT current_timestamp(),
+  `email_checked` tinyint(4) NOT NULL DEFAULT 0,
+  `passphrase_shown` tinyint(4) NOT NULL DEFAULT 0,
+  `language` varchar(4) NOT NULL DEFAULT 'de',
+  `disabled` tinyint(4) DEFAULT 0,
+  `group_id` int(10) unsigned DEFAULT 0,
+  `publisher_id` int(11) DEFAULT 0,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `email` (`email`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
