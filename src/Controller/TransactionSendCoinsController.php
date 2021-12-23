@@ -37,6 +37,7 @@ class TransactionSendCoinsController extends AppController
         //$this->Auth->allow(['add', 'edit']);
         $this->Auth->allow('create');
         $this->Auth->allow('createRaw');
+        $this->Auth->allow('ajaxCreate');
         $this->set(
             'naviHierarchy',
             (new NaviHierarchy())->
@@ -56,8 +57,9 @@ class TransactionSendCoinsController extends AppController
             'contain' => ['Transactions', 'StateUsers', 'ReceiverUsers']
         ];
         $transactionSendCoins = $this->paginate($this->TransactionSendCoins);
+        $simple = $this->TransactionSendCoins->find('all');
 
-        $this->set(compact('transactionSendCoins'));
+        $this->set(compact('transactionSendCoins', 'simple'));
     }
 
     /**
@@ -145,10 +147,17 @@ class TransactionSendCoinsController extends AppController
           }
           $user = $session->read('StateUser');
         }
+        
+        $known_groups = $this->JsonRequestClient->sendRequest(json_encode([
+                'ask' => ['groups']
+            ]), '/networkInfos');
+        
 
         $transferForm = new TransferForm();
         $this->set('transferForm', $transferForm);
         $this->set('timeUsed', microtime(true) - $startTime);
+        $this->set('groups', $known_groups['data']['data']['groups']);
+        $this->set('user', $user);
 
         if ($this->request->is('post')) {
           //$this->Flash->error(__('Wird zurzeit noch entwickelt!'));
@@ -158,23 +167,145 @@ class TransactionSendCoinsController extends AppController
           if(isset($requestData['add'])) {$mode = 'add'; }
           if($transferForm->validate($requestData)) {
 
-            $receiverPubKeyHex = '';
-            $senderPubKeyHex = $user['public_hex'];
             $amountCent = $this->GradidoNumber->parseInputNumberToCentNumber($requestData['amount']);
 
             if(!isset($user['balance']) || $amountCent > $user['balance']) {
-              $this->Flash->error(__('Du hast nicht genug Geld!'));
+              $this->Flash->error(__('Du hast nicht genug Gradidos!'));
               return;
             }
-
+            
             $receiverEmail = $requestData['email'];
             if($receiverEmail === $user['email']) {
-              $this->Flash->error(__('Du kannst dir leider nicht selbst Geld schicken!'));
+              $this->Flash->error(__('Du kannst dir selbst keine Gradidos senden!'));
               return;
             }
-            $receiverPubkeyHex ='';
             $requestAnswear = $this->JsonRequestClient->sendRequest(json_encode([
                 'session_id' => $session->read('session_id'),
+                'transaction_type' => 'transfer',
+                'memo' => $requestData['memo'],
+                'amount' => $amountCent,
+                'group' => $known_groups['data']['data']['groups'][$requestData['group']],
+                'target_email'  => $receiverEmail,
+                'blockchain_type' => $this->blockchainType
+            ]), '/createTransaction');
+            
+            if('success' == $requestAnswear['state'] && 'success' == $requestAnswear['data']['state']) {
+                $pendingTransactionCount = $session->read('Transactions.pending');
+                if($pendingTransactionCount == null) {
+                  $pendingTransactionCount = 1;
+                } else {
+                  $pendingTransactionCount++;
+                }
+                $session->write('Transactions.pending', $pendingTransactionCount);
+                //echo "pending: " . $pendingTransactionCount;
+                if($mode === 'next') {
+                  return $this->redirect($this->loginServerUrl . 'account/checkTransactions', 303);
+                } else {
+                  $this->Flash->success(__('Transaction submitted for review.'));
+                }
+            } else {
+              
+              /*
+               * if request contain unknown parameter format, shouldn't happen't at all
+               * {"state": "error", "msg": "parameter format unknown"}
+               * if json parsing failed
+               * {"state": "error", "msg": "json exception", "details":"exception text"}
+               * if session_id is zero or not set
+               * {"state": "error", "msg": "session_id invalid"}
+               * if session id wasn't found on login server, if server was restartet or user logged out (also per timeout, default: 15 minutes)
+               * {"state": "error", "msg": "session not found"}
+               * if session hasn't active user, shouldn't happen't at all, login-server should be checked if happen
+               * {"state": "code error", "msg":"user is zero"}
+               * if transaction type not known
+               * {"state": "error", "msg":"transaction_type unknown"}
+               * if receiver wasn't known to Login-Server
+               * {"state": "not found", "msg":"receiver not found"}
+               * if receiver account disabled, and therefor cannto receive any coins
+               * {"state": "disabled", "msg":"receiver is disabled"}
+               * if transaction was okay and will be further proccessed
+               * {"state":"success"}
+               */
+               $answear_data = $requestAnswear['data'];
+               if($answear_data['state'] === 'error') {
+                 if($answear_data['msg'] === 'session_id invalid' || $answear_data['msg'] === 'session not found') {
+                   $this->Flash->error(__('Fehler mit der Session, bitte logge dich erneut ein!'));
+                   $this->set('timeUsed', microtime(true) - $startTime);
+                   return;
+                 }
+                 if($answear_data['msg'] === 'user not in group') {
+                   $this->Flash->error(__('Empfänger befindet sich nicht in Zielgruppe!'));
+                   $this->set('timeUsed', microtime(true) - $startTime);
+                   return;
+                 }
+                 if($answear_data['msg'] === 'memo is not set or not in expected range [5;150]') {
+                    $this->Flash->error(__('Ein Verwendungszweck zwischen 5 und 150 Zeichen wird benötig!'));
+                    $this->set('timeUsed', microtime(true) - $startTime);
+                    return;
+                 }
+               } else if($answear_data['state'] === 'not found' && $answear_data['msg'] === 'receiver not found') {
+                  $this->Flash->error(__('Der Empfänger wurde nicht auf dem Login-Server gefunden, hat er sein Konto schon angelegt?'));
+                  $this->set('timeUsed', microtime(true) - $startTime);
+                  return;
+               } else if($answear_data['state'] === 'disabled') {
+                  $this->Flash->error(__('Der Empfänger ist deaktiviert, daher können ihm zurzeit keine Gradidos gesendet werden.'));
+                  $this->set('timeUsed', microtime(true) - $startTime);
+                  return;
+               } else {
+                  $this->Flash->error(__('Unbehandelter Fehler: ') . json_encode($answear_data));
+                  $this->set('timeUsed', microtime(true) - $startTime);
+                  return;
+               }
+               
+            }
+          }
+        }
+        
+        $this->set('timeUsed', microtime(true) - $startTime);
+    }
+    
+    public function ajaxCreate() 
+    {
+        if ($this->request->is('post')) {
+            $startTime = microtime(true);
+            $jsonData = $this->request->input('json_decode', true);
+            $session_id = $jsonData['session_id'];
+            if(!$session_id) {
+                return $this->returnJson(['state' => 'error', 'msg' => 'invalid session id']);
+            }
+            
+            $login_result = $this->requestLogin($session_id, false);
+            if($login_result !== true) {
+                return $this->returnJson($login_result);
+            }
+            $session = $this->getRequest()->getSession();
+            $user = $session->read('StateUser');            
+            
+            $receiverPubKeyHex = '';
+            $senderPubKeyHex = $user['public_hex'];
+
+            if(!isset($jsonData['amount']) || !isset($jsonData['email'])) {
+                return $this->returnJson(['state' => 'parameter missing', 'msg' => 'amount and/or email not set']);
+            }
+            $amount = intval($jsonData['amount']);
+            if($amount < 0) {
+                return $this->returnJson(['state' => 'error', 'msg' => 'amout must be > 0 and int']);
+            }
+            
+            if(!isset($user['balance']) || $jsonData['amount'] > $user['balance']) {
+              return $this->returnJson(['state' => 'error', 'msg' => 'not enough GDD']);
+            }
+            $memo = '';
+            if(isset($jsonData['memo'])) {
+                $memo = $jsonData['memo'];
+            }
+
+            $receiverEmail = $jsonData['email'];
+            if($receiverEmail === $user['email']) {
+              return $this->returnJson(['state' => 'error', 'msg' => 'sender and receiver email are the same']);
+            }
+
+            $requestAnswear = $this->JsonRequestClient->sendRequest(json_encode([
+                'session_id' => $session_id,
                 'email' => $receiverEmail,
                 'ask' => ['user.pubkeyhex', 'user.disabled']
             ]), '/getUserInfos');
@@ -182,111 +313,91 @@ class TransactionSendCoinsController extends AppController
               // will be allways 64 byte long, even if it is empty
               $receiverPubKeyHex = $requestAnswear['data']['userData']['pubkeyhex'];
             } else {
-              $this->addAdminError('TransactionSendCoins', 'create', $requestAnswear, $user['id']);
-              $this->Flash->error(__('Der Empfänger wurde nicht auf dem Login-Server gefunden, hat er sein Konto schon angelegt?'));
-              $this->set('timeUsed', microtime(true) - $startTime);
-                return;
+              return $this->returnJson([
+                  'state' => 'error', 
+                  'msg' => 'receiver email not found on login-server', 
+                  'details' => $requestAnswear,
+                  'timeUsed' => microtime(true) - $startTime
+              ]);
             }
             if($requestAnswear['data']['userData']['disabled']) {
-              $this->Flash->error(__('Der Empfänger ist deaktiviert, daher können ihm zurzeit keine Gradidos gesendet werden.'));
-              $this->set('timeUsed', microtime(true) - $startTime);
-              return;
+                return $this->returnJson([
+                    'state' => 'error',
+                    'msg' => 'receiver is currently disabled, he cannot receive payments',
+                    'timeUsed' => microtime(true) - $startTime
+                ]);
             }
-              
-          
-            if(0 == ord($receiverPubKeyHex)) {
-              $stateUserTable = TableRegistry::getTableLocator()->get('StateUsers');
-              $receiverUser = $stateUserTable
-                       ->find('all')
-                       ->select(['public_key'])
-                       ->contain(false)
-                       ->where(['email' => $receiverEmail]);
-              
-              
-              if(!$receiverUser) {
-                $this->Flash->error(__('Diese E-Mail ist mir nicht bekannt, hat dein Empfänger denn schon ein Gradido-Konto?'));
-                $this->set('timeUsed', microtime(true) - $startTime);
-                return;
-              }
-               
-                if(isset($receiverUser->public_key)) {
-                  $receiverPubKeyHex = bin2hex(stream_get_contents($receiverUser->public_key));
-                } else {
-                  $this->Flash->error(__('Das Konto mit der E-Mail: ' . $receiverEmail . ' wurde noch nicht aktiviert und kann noch keine GDD empfangen!'));
-                  $this->set('timeUsed', microtime(true) - $startTime);
-                  return;
-                }
-               
-            }
+
+            
             //var_dump($sessionStateUser);
 
             $builderResult = TransactionTransfer::build(
-                    $amountCent,
-                    $requestData['memo'],
+                    $amount,
+                    $memo,
                     $receiverPubKeyHex,
                     $senderPubKeyHex
             );
+            $auto_sign = true;
+            if(isset($jsonData['auto_sign'])) {
+                $auto_sign = $jsonData['auto_sign'];
+            }
             if($builderResult['state'] === 'success') {
 
               $http = new Client();
               try {
                 $loginServer = Configure::read('LoginServer');
                 $url = $loginServer['host'] . ':' . $loginServer['port'];
-                $session_id = $session->read('session_id');
-                /*
-                 *
-                 *  $response = $http->post(
-                 *    'http://example.com/tasks',
-                 *    json_encode($data),
-                 *    ['type' => 'json']
-                 *  );
-                 */
+               
                 $response = $http->post($url . '/checkTransaction', json_encode([
                     'session_id' => $session_id,
                     'transaction_base64' => base64_encode($builderResult['transactionBody']->serializeToString()),
+                    'auto_sign' => $auto_sign,
                     'balance' => $user['balance']
                 ]), ['type' => 'json']);
                 $json = $response->getJson();
                 if($json['state'] != 'success') {
                   if($json['msg'] == 'session not found') {
                     $session->destroy();
-                    return $this->redirect($this->loginServerUrl . 'account', 303);
+                    return $this->returnJson([
+                        'state' => 'error',
+                        'msg' => 'session not found',
+                        'details' => $session_id,
+                        'timeUsed' => microtime(true) - $startTime
+                    ]);
                     //$this->Flash->error(__('session not found, please login again'));
                   } else {
-                    $this->Flash->error(__('login server return error: ' . json_encode($json)));
+                      return $this->returnJson([
+                          'state' => 'error',
+                          'msg' => 'login server return error',
+                          'details' => $json,
+                          'timeUsed' => microtime(true) - $startTime
+                      ]);
                   }
                 } else {
-                  $pendingTransactionCount = $session->read('Transactions.pending');
-                  if($pendingTransactionCount == null) {
-                    $pendingTransactionCount = 1;
-                  } else {
-                    $pendingTransactionCount++;
-                  }
-                  $session->write('Transactions.pending', $pendingTransactionCount);
-                  //echo "pending: " . $pendingTransactionCount;
-                  if($mode === 'next') {
-                    return $this->redirect($this->loginServerUrl . 'account/checkTransactions', 303);
-                  } else {
-                    $this->Flash->success(__('Transaction submitted for review.'));
-                  }
+                    return $this->returnJson(['state' => 'success', 'timeUsed' => microtime(true) - $startTime]);
                 }
 
               } catch(\Exception $e) {
                   $msg = $e->getMessage();
-                  $this->Flash->error(__('error http request: ') . $msg);
+                  //$this->Flash->error(__('error http request: ') . $msg);
+                  return $this->returnJson([
+                      'state' => 'error',
+                      'msg' => 'error http request',
+                      'details' => $msg,
+                      'timeUsed' => microtime(true) - $startTime
+                  ]);
               }
 
             } else {
-              $this->Flash->error(__('No Valid Receiver Public given: ' . $receiverPubKeyHex));
+                return $this->returnJson([
+                    'state' => 'error',
+                    'msg' => 'no valid receiver public key given',
+                    'details' => $receiverPubKeyHex,
+                    'timeUsed' => microtime(true) - $startTime
+                ]);
             }
-
-//           */
-          } else {
-            $this->Flash->error(__('Something was invalid, please try again!'));
-          }
         }
-
-        $this->set('timeUsed', microtime(true) - $startTime);
+        return $this->returnJson(['state' => 'error', 'msg' => 'no post request']);
     }
 
     public function createRaw()

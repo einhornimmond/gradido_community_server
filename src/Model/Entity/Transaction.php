@@ -7,13 +7,16 @@ use Cake\ORM\Entity;
  * Transaction Entity
  *
  * @property int $id
+ * @property int $nr
  * @property int $state_group_id
  * @property int $transaction_type_id
  * @property string|resource $tx_hash
  * @property \Cake\I18n\FrozenTime $received
+ * @property int $transaction_state_id
  *
  * @property \App\Model\Entity\StateGroup $state_group
  * @property \App\Model\Entity\TransactionType $transaction_type
+ * @property \App\Model\Entity\TransactionState $transaction_state
  * @property \App\Model\Entity\StateCreated[] $state_created
  * @property \App\Model\Entity\TransactionCreation[] $transaction_creations
  * @property \App\Model\Entity\TransactionGroupAddaddres[] $transaction_group_addaddress
@@ -34,14 +37,17 @@ class Transaction extends Entity
      * @var array
      */
     protected $_accessible = [
+        'nr' => true,
         'state_group_id' => true,
         'transaction_type_id' => true,
         'tx_hash' => true,
         'memo' => true,
         'received' => true,
+        'blockchain_type_id' => true,
         'state_group' => true,
         'transaction_type' => true,
         'state_created' => true,
+        'transaction_state_id' => true,
         'transaction_creations' => true,
         'transaction_group_addaddress' => true,
         'transaction_group_allowtrades' => true,

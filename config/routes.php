@@ -57,25 +57,43 @@ Router::scope('/', function (RouteBuilder $routes) {
     $csrf->whitelistCallback(function ($request) {
         // Skip token check for API URLs.
       //die($request->getParam('controller'));
-        $whitelist = ['JsonRequestHandler', 'ElopageWebhook'];
+        $whitelist = ['JsonRequestHandler', 'ElopageWebhook', 'AppRequests'];
+        $ajaxWhitelist = ['TransactionSendCoins', 'TransactionCreations'];
+
+        $callerIp = $request->clientIp();
         
         foreach($whitelist as $entry) {
           if($request->getParam('controller') === $entry) {
-            if($entry == 'ElopageWebhook') {
+            if($entry == 'ElopageWebhook' || $entry == 'AppRequests') {
               return true;
             }
-            if($request->clientIp() == '127.0.0.1' || $request->clientIp() == 'localhost') {
-              return true;
+            $allowedIpLocalhost = ['127.0.0.1', 'localhost', '', '::1'];
+            if(in_array($callerIp, $allowedIpLocalhost)) {
+                return true;
             }
             $allowedCaller = Configure::read('API.allowedCaller');
+            $ipPerHost = [];
             if($allowedCaller && count($allowedCaller) > 0) {
-                $callerIp = $request->clientIp();
+                
                 foreach($allowedCaller as $allowed) {
                   $ip = gethostbyname($allowed);
+                  $ipPerHost[$allowed] = $ip;
                   if($ip === $callerIp) return true;
                 }
+                //die("caller ip: $callerIp<br>");
             }
+			//var_dump(['caller_ip' => $callerIp, 'ips' => $ipPerHost]);
+            die(json_encode(['state' => 'error', 'details' => ['caller_ip' => $callerIp, 'ips' => $ipPerHost]]));
           }
+        }
+        // disable csfr for all ajax requests in ajax whitelisted controller
+        foreach($ajaxWhitelist as $entry) {
+            if($request->getParam('controller') === $entry) {
+                $action = $request->getParam('action');
+                if(preg_match('/^ajax/', $action)) {
+                    return true;
+                }
+            }
         }
     });
 
@@ -95,7 +113,11 @@ Router::scope('/', function (RouteBuilder $routes) {
      */
     //$routes->connect('/', ['controller' => 'Pages', 'action' => 'display', 'home']);
     $routes->connect('/', ['controller' => 'Dashboard', 'action' => 'index']);
+    $routes->connect('/api/:action/*', ['controller' => 'AppRequests'], ['routeClass' => 'DashedRoute']);
+    //$routes->connect('/client', ['controller' => 'Pages', 'action' => 'display', 'js']);
     $routes->connect('/server', ['controller' => 'Dashboard', 'action' => 'serverIndex']);
+    $routes->connect('/client', ['controller' => 'Pages', 'action' => 'display', 'vue']);
+    $routes->connect('/vue-dev', ['controller' => 'Pages', 'action' => 'display', 'vue-dev']);
     //$routes->connect('/', 'https://gradido2.dario-rekowski.de/account', array('status' => 303));
 
     /**

@@ -3,6 +3,9 @@ namespace App\Test\TestCase\Controller;
 
 use Cake\TestSuite\IntegrationTestTrait;
 use Cake\TestSuite\TestCase;
+use Cake\ORM\TableRegistry;
+use Cake\I18n\Time;
+
 
 /**
  * App\Controller\StateBalancesController Test Case
@@ -22,12 +25,19 @@ class StateBalancesControllerTest extends TestCase
         'app.TransactionCreations',
         'app.Transactions',
         'app.StateUsers',
+        'app.StateUserTransactions',
         'app.StateErrors',
         'app.TransactionSignatures',
         'app.TransactionSendCoins',
         'app.StateBalances',
         'app.TransactionTypes'
     ];
+    
+    public function setUp()
+    {
+        parent::setUp();
+        $this->StateBalances = TableRegistry::getTableLocator()->get('StateBalances');
+    }
 
     /**
      * Test initialize method
@@ -59,39 +69,7 @@ class StateBalancesControllerTest extends TestCase
         $this->markTestIncomplete('Not implemented yet.');
     }
 
-    /**
-     * Test ajaxGetBalance method
-     *
-     * @return void
-     */
-    public function testAjaxGetBalance()
-    {
-        $session_id = rand();
-        $balance = rand();
-        $this->session([
-            'session_id' => $session_id,
-            'Transaction' => ['pending' => 0, 'executing' => 0],
-            'StateUser' => [
-                'id' => 2, // 1 don't work, I don't know why
-                'email_checked' => 1,
-                'balance' => $balance
-            ]
-        ]);
-        //echo "balance: $balance";
-        $this->getAndParse('/state-balances/ajaxGetBalance/' . $session_id, 
-                ['state' => 'success', 'balance' => $balance]
-        );
-    }
-
-    /**
-     * Test ajaxListTransactions method
-     *
-     * @return void
-     */
-    public function testAjaxListTransactions()
-    {
-        $this->markTestIncomplete('Not implemented yet.');
-    }
+    
 
     /**
      * Test overviewGdt method
@@ -169,10 +147,33 @@ class StateBalancesControllerTest extends TestCase
         $responseBodyString = (string)$this->_response->getBody();
         $json = json_decode($responseBodyString);
         $this->assertNotFalse($json);
-        
+
         if(is_array($expected)) {
+            // copy timeUsed because this value will be variy always
+          if(isset($expected['timeUsed']) && isset($json->timeUsed)) {
+              $expected['timeUsed'] = $json->timeUsed;
+          }
           $expected = json_encode($expected);
         }
+        
         $this->assertEquals($expected, $responseBodyString);
+    }
+    private function getAndParseWithoutCompare($path) 
+    {
+        $this->configRequest([
+            'headers' => ['Accept' => 'application/json']
+        ]);
+        
+        $this->disableErrorHandlerMiddleware();
+        $this->get($path);        
+        
+        // Check that the response was a 200
+        $this->assertResponseOk();     
+        
+        $responseBodyString = (string)$this->_response->getBody();
+        $json = json_decode($responseBodyString);
+        $this->assertNotFalse($json);
+
+        return $json;
     }
 }

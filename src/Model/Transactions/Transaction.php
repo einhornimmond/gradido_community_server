@@ -25,7 +25,7 @@ class Transaction extends TransactionBase {
         //$transactionBin = base64_decode($base64Data, true);
         //if($transactionBin == false) {
       //sodium_base64_VARIANT_URLSAFE_NO_PADDING
-      if(is_a($base64Data, '\Model\Messages\Gradido\Transaction')) {
+      if(is_a($base64Data, '\Proto\Gradido\GradidoTransaction')) {
         $this->mProtoTransaction = $base64Data;
         $this->mTransactionBody = new TransactionBody($this->mProtoTransaction->getBodyBytes());
         return;
@@ -39,6 +39,7 @@ class Transaction extends TransactionBase {
          $transactionBin = base64_decode($base64Data, true);
          if($transactionBin == false) {
            $this->addError('Transaction', $e->getMessage());// . ' ' . $base64Data);
+           $this->addError('base64', $base64Data);
            return;
          }
       }
@@ -49,7 +50,7 @@ class Transaction extends TransactionBase {
           $this->addError('Transaction', 'base64 decode error: ' . $base64Data);
         } else {
           //var_dump($transactionBin);
-          $this->mProtoTransaction = new \Model\Messages\Gradido\Transaction();
+          $this->mProtoTransaction = new \Proto\Gradido\GradidoTransaction();
           try {
             $this->mProtoTransaction->mergeFromString($transactionBin);
             //var_dump($this->mProtoTransaction);
@@ -69,11 +70,11 @@ class Transaction extends TransactionBase {
         }
     }
     
-    static public function build(\Model\Messages\Gradido\TransactionBody $transactionBody, $senderKeyPair) 
+    static public function build(\Proto\Gradido\TransactionBody $transactionBody, $senderKeyPair) 
     {
-        $protoTransaction = new \Model\Messages\Gradido\Transaction();
+        $protoTransaction = new \Proto\Gradido\GradidoTransaction();
         
-        $recevied = new \Model\Messages\Gradido\TimestampSeconds();
+        $recevied = new \Proto\Gradido\TimestampSeconds();
         $recevied->setSeconds(time());
         $protoTransaction->setReceived($recevied);
         
@@ -92,9 +93,18 @@ class Transaction extends TransactionBase {
       return $this->mTransactionBody;
     }
     
-    public function getFirstPublic() {
+    public function getFirstPublic() 
+    {
+      if(!$this->mProtoTransaction || !$this->mProtoTransaction->getSigMap()) {
+          return '';
+      }
       $sigPairs = $this->mProtoTransaction->getSigMap()->getSigPair();
       return $sigPairs[0]->getPubKey();
+    }
+    
+    public function getFirstSigningUser()
+    {
+        return $this->getStateUserFromPublickey($this->getFirstPublic());
     }
     
     public function getId() {
@@ -105,6 +115,7 @@ class Transaction extends TransactionBase {
         $sigMap = $this->mProtoTransaction->getSigMap();
         if(!$sigMap) {
           $this->addError('Transaction', 'signature map is zero');
+          //var_dump($this->mProtoTransaction);
           return false;
         }
         //var_dump($sigMap);
@@ -122,7 +133,7 @@ class Transaction extends TransactionBase {
         foreach($sigPairs as $sigPair) {
           //echo 'sig Pair: '; var_dump($sigPair); echo "<br>";
           $pubkey = $sigPair->getPubKey();
-          $signature = $sigPair->getEd25519();
+          $signature = $sigPair->getSignature();
           //echo "verify bodybytes: <br>" . bin2hex($bodyBytes) . '<br>';
           if (!\Sodium\crypto_sign_verify_detached($signature, $bodyBytes, $pubkey)) {
               $this->addError('Transaction::validate', 'signature for key ' . bin2hex($pubkey) . ' isn\'t valid ' );
@@ -137,21 +148,60 @@ class Transaction extends TransactionBase {
         
         return true;
     }
+
+    public function checkWithDb($dbTransaction)
+    {
+       $functionName = 'Transaction::checkWithDb';
+       $transactionsSignaturesTable = $this->getTable('transaction_signatures');
+       $dbSignatures = $transactionsSignaturesTable->find('all')->where(['transaction_id' => $dbTransaction->id]);
+       $sortedDBSignatures = [];
+       foreach($dbSignatures as $dbSignature) {
+         $publicKeyHex = \Sodium\bin2hex(stream_get_contents($dbSignature->pubkey));
+         $sortedDBSignatures[$publicKeyHex] = $dbSignature->signature;
+       }
+       $sigPairs = $this->mProtoTransaction->getSigMap()->getSigPair();
+       $signaturesMatch = true;
+       if(count($sortedDBSignatures) == count($sigPairs)) {
+          foreach($sigPairs as $sigPair) {
+            $publicKeyHex = \Sodium\bin2hex($sigPair->getPubKey());
+            if(!isset($sortedDBSignatures[$publicKeyHex])) {
+              $this->addError($functionName, 'couldn\'t find public key from received transaction in db: ' . $publicKeyHex);
+              $signaturesMatch = false;
+              break;
+            }
+            if($sortedDBSignatures[$publicKeyHex] != $sigPair->getSignature()) {
+              $this->addError($functionName, 'signatures for pubkey: ' . $publicKeyHex . ' don\'t match');
+              $signaturesMatch = false;
+              break;
+            }
+          }
+       }
+       if($signaturesMatch) {
+         return true;
+       }
+       $this->addError($functionName, 'signatures don\'t match');
+       // check more parameter
+       $result = $this->mTransactionBody->checkWithDb($dbTransaction);
+       $this->addErrors($this->mTransactionBody->getErrors());
+       return $result;
+
+    }
     
-    public function save()
+    public function save($blockchainType)
     {
       $connection = ConnectionManager::get('default');
       $connection->begin();
       //id transaction_id signature     pubkey 
       
-       if (!$this->mTransactionBody->save($this->getFirstPublic(), $this->mProtoTransaction->getSigMap())) {
+       if (!$this->mTransactionBody->save($this->getFirstPublic(), $this->mProtoTransaction->getSigMap(), $blockchainType)) {
           $this->addErrors($this->mTransactionBody->getErrors());
           $connection->rollback();
+
           return false;
       }
       
       // save transaction signatures
-      $transactionsSignaturesTable = TableRegistry::getTableLocator()->get('transaction_signatures');
+      $transactionsSignaturesTable = $this->getTable('transaction_signatures');
       $transactionId = $this->mTransactionBody->getTransactionID();
       //signature     pubkey
       
@@ -161,7 +211,7 @@ class Transaction extends TransactionBase {
       foreach($sigPairs as $sigPair) {
           $signatureEntity = $transactionsSignaturesTable->newEntity();
           $signatureEntity->transaction_id = $transactionId;
-          $signatureEntity->signature = $sigPair->getEd25519();
+          $signatureEntity->signature = $sigPair->getSignature();
           $signatureEntity->pubkey = $sigPair->getPubKey();
           array_push($signatureEntitys, $signatureEntity);
       }
@@ -180,8 +230,10 @@ class Transaction extends TransactionBase {
       
       $connection->commit();
       
-      $this->mTransactionBody->getSpecificTransaction()->sendNotificationEmail($this->mTransactionBody->getMemo());
+      $specificTransaction = $this->mTransactionBody->getSpecificTransaction();
       
+      $specificTransaction->sendNotificationEmail($this->mTransactionBody->getMemo());
+      $this->addWarnings($specificTransaction->getWarnings());
       return true;
     }
 
@@ -197,14 +249,14 @@ class Transaction extends TransactionBase {
                     'TransactionSignatures'])
                 ->first();
         //var_dump($transactionEntry->toArray());
-        $protoTransaction = new \Model\Messages\Gradido\Transaction();
+        $protoTransaction = new \Proto\Gradido\Transaction();
         
         
         
         $protoTransaction->setId($transactionEntry->id);
 
         
-        $recevied = new \Model\Messages\Gradido\TimestampSeconds();
+        $recevied = new \Proto\Gradido\TimestampSeconds();
         $recevied->setSeconds($transactionEntry->received->getTimestamp());
         $protoTransaction->setReceived($recevied);
         
@@ -228,7 +280,7 @@ class Transaction extends TransactionBase {
         }
         
         //echo "verify bodybytes: <br>" . bin2hex($bodyBytes) . '<br>';
-        $created = new \Model\Messages\Gradido\TimestampSeconds();
+        $created = new \Proto\Gradido\TimestampSeconds();
         $created->setSeconds($recevied->getSeconds());
         $body->setCreated($created);
         $bodyBytes = $body->serializeToString();
@@ -239,7 +291,7 @@ class Transaction extends TransactionBase {
         foreach($sigPairs as $sigPair) {
           //echo 'sig Pair: '; var_dump($sigPair); echo "<br>";
           $pubkey = $sigPair->getPubKey();
-          $signature = $sigPair->getEd25519();
+          $signature = $sigPair->getSignature();
           if(!$createRight) {
             while($createTrys < 500) {
               if(\Sodium\crypto_sign_verify_detached($signature, $bodyBytes, $pubkey)) {

@@ -3,6 +3,8 @@
 namespace Model\Transactions;
 
 use Cake\ORM\TableRegistry;
+use Cake\I18n\FrozenDate;
+use Cake\I18n\FrozenTime;
 
 class TransactionBody extends TransactionBase {
   private $mProtoTransactionBody = null;
@@ -11,7 +13,7 @@ class TransactionBody extends TransactionBase {
   private $transactionTypeId = 0;
   
   public function __construct($bodyBytes) {
-    $this->mProtoTransactionBody = new \Model\Messages\Gradido\TransactionBody();
+    $this->mProtoTransactionBody = new \Proto\Gradido\TransactionBody();
     try {
       $this->mProtoTransactionBody->mergeFromString($bodyBytes);
       // cannot catch Exception with cakePHP, I don't know why
@@ -42,17 +44,51 @@ class TransactionBody extends TransactionBase {
       
     // check if creation time is in the past
     if($this->mProtoTransactionBody->getCreated()->getSeconds() > time()) {
-      $this->addError('TransactionBody::validate', 'Transaction were created in the past!');
+      $this->addError('TransactionBody::validate', 'Transaction were created in the future!');
       return false;
     }
-    if(!$this->mSpecificTransaction->validate($sigPairs)) {
+    if(!$this->mSpecificTransaction->validate($sigPairs, new FrozenDate($this->mProtoTransactionBody->getCreated()->getSeconds()))) {
       $this->addErrors($this->mSpecificTransaction->getErrors());
       return false;
-    }
-    
-    
+    }   
       
     return true;
+  }
+
+  public function checkWithDb($dbTransaction)
+  {
+     $functionName = 'TransactionBody::checkWithDb';
+     if($this->getMemo() != $dbTransaction->memo) {
+        $this->addError($functionName, 'memos don\'t match');
+        $this->addError($functionName, 'stored: ' . $dbTransaction->memo);
+        $this->addError($functionName, 'received: ' . $this->getMemo());
+        return false;
+     }
+     // currently not stored in db
+     /*$created = new FrozenTime($this->mProtoTransactionBody->getCreated()->getSeconds());
+     if($created != $dbTransaction->created) {
+        $this->addError($functionName, 'created date don\'t match' . json_encode([
+          'stored' => $dbTransaction->created ? $dbTransaction->created->i18nFormat(): null,
+          'received' => $created->i18nFormat()
+        ]));
+        return false;
+     }*/
+     if($this->getTransactionTypeName() != $dbTransaction->transaction_type->name) {
+       $this->addError($functionName, 'transaction types not the same: ' .  json_encode([
+         'stored' => $dbTransaction->transaction_type->name,
+         'received' => $this->getTransactionTypeName()
+       ]));
+       return false;
+     }
+     $specificTransaction = $this->getSpecificTransaction();
+     if($specificTransaction) {
+        $result = $specificTransaction->checkWithDb($dbTransaction);
+        $this->addErrors($specificTransaction->getErrors());
+        return $result;
+     }
+     $this->addError($functionName, 'no specific transaction');
+     return false;
+
   }
   
   public function getSpecificTransaction() {
@@ -68,18 +104,34 @@ class TransactionBody extends TransactionBase {
     return $this->mProtoTransactionBody->getData(); 
   }
   
-  public function save($firstPublic, $sigMap) {
-      $transactionsTable = TableRegistry::getTableLocator()->get('transactions');
+  public function save($firstPublic, $sigMap, $blockchainType) {
+      $transactionsTable = $this->getTable('transactions');
       $transactionEntity = $transactionsTable->newEntity();
-      
-      
+            
       $transactionEntity->transaction_type_id = $this->transactionTypeId;
       $transactionEntity->memo = $this->getMemo();
+      $transactionEntity->transaction_state_id = 1;
       
+      // find out next transaction nr
+      $lastTransaction = $transactionsTable
+                          ->find('all', ['contain' => false])
+                          ->select(['nr', 'tx_hash'])
+                          ->order(['nr' => 'DESC'])
+                          ->limit(1)
+                          ->epilog('FOR UPDATE') // lock indexes from updates in other sessions
+                          ;
+      if($lastTransaction->count() >= 1) {
+        $transactionEntity->nr = $lastTransaction->first()->nr + 1;
+      } else {
+        $transactionEntity->nr = 1;
+      }                       
+
       if ($transactionsTable->save($transactionEntity)) {
+          // reload entity to get received date filled from mysql
+        $transactionEntity = $transactionsTable->get($transactionEntity->id);
         // success
         $this->mTransactionID = $transactionEntity->id;
-        if(!$this->mSpecificTransaction->save($transactionEntity->id, $firstPublic)) {
+        if(!$this->mSpecificTransaction->save($transactionEntity->id, $firstPublic, $transactionEntity->received)) {
           $this->addErrors($this->mSpecificTransaction->getErrors());
           return false;
         }  
@@ -88,12 +140,13 @@ class TransactionBody extends TransactionBase {
         return false;
       }
       $previousTxHash = null;
-      if($this->mTransactionID > 1) {
+      $previousTxState = 0;
+      if($transactionEntity->nr > 1) {
         try {
           $previousTransaction = $transactionsTable
                   ->find('all', ['contain' => false])
-                  ->select(['tx_hash'])
-                  ->where(['id' => $this->mTransactionID - 1])
+                  ->select(['tx_hash', 'transaction_state_id'])
+                  ->where(['nr' => $transactionEntity->nr - 1])
                   ->first();
           /*$previousTransaction = $transactionsTable->get($this->mTransactionID - 1, [
               'contain' => false, 
@@ -109,6 +162,7 @@ class TransactionBody extends TransactionBase {
           return false;
         }
         $previousTxHash = $previousTransaction->tx_hash;
+        $previousTxState = $previousTransaction->transaction_state_id;
       }
       try {
         //$transactionEntity->received = $transactionsTable->get($transactionEntity->id, ['contain' => false, 'fields' => ['received']])->received;
@@ -131,11 +185,15 @@ class TransactionBody extends TransactionBase {
         \Sodium\crypto_generichash_update($state, stream_get_contents($previousTxHash));
       }
       //echo "id: " . $transactionEntity->id . "\n";
-      \Sodium\crypto_generichash_update($state, strval($transactionEntity->id));
+      \Sodium\crypto_generichash_update($state, strval($transactionEntity->nr));
       //echo "received: " . $transactionEntity->received;
       \Sodium\crypto_generichash_update($state, $transactionEntity->received->i18nFormat('yyyy-MM-dd HH:mm:ss'));
       \Sodium\crypto_generichash_update($state, $sigMap->serializeToString());
       $transactionEntity->tx_hash = \Sodium\crypto_generichash_final($state);
+      $transactionEntity->transaction_state_id = 2;
+      if($previousTxState == 3 && $blockchainType == 'mysql') {
+        $transactionEntity->transaction_state_id = 3;
+      }
       if ($transactionsTable->save($transactionEntity)) {
         return true;
       }
@@ -153,7 +211,7 @@ class TransactionBody extends TransactionBase {
   
   static public function fromEntity($memo, $transaction) 
   {
-    $protoBody = new \Model\Messages\Gradido\TransactionBody();
+    $protoBody = new \Proto\Gradido\TransactionBody();
     $protoBody->setMemo($memo);
     
     //$created->setSeconds($var);
@@ -174,7 +232,7 @@ class TransactionBody extends TransactionBase {
   
   static public function build($memo, $specificTransaction) 
   {
-    $protoBody = new \Model\Messages\Gradido\TransactionBody();
+    $protoBody = new \Proto\Gradido\TransactionBody();
     $protoBody->setMemo($memo);
     
     if(is_a($specificTransaction, 'TransactionCreation')) {

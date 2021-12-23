@@ -21,7 +21,7 @@ use Cake\Routing\Router;
 use Cake\ORM\TableRegistry;
 use Cake\Core\Configure;
 use Cake\I18n\Time;
-use Cake\I18n\I18n;
+use Cake\I18n\FrozenTime;
 
 /**
  * Application Controller
@@ -35,6 +35,7 @@ class AppController extends Controller
 {
 
     var $loginServerUrl = '';
+    var $blockchainType = 'mysql';
     /**
      * Initialization hook method.
      *
@@ -87,20 +88,8 @@ class AppController extends Controller
         // load current balance
         $session = $this->getRequest()->getSession();
         $state_user_id = $session->read('StateUser.id');
-        if ($state_user_id) {
-            $stateBalancesTable = TableRegistry::getTableLocator()->get('stateBalances');
-            $stateBalanceQuery = $stateBalancesTable
-                  ->find('all')
-                  ->select('amount')
-                  ->contain(false)
-                  ->where(['state_user_id' => $state_user_id]);
-            if ($stateBalanceQuery->count() == 1) {
-              //var_dump($stateBalanceEntry->first());
-                $session->write('StateUser.balance', $stateBalanceQuery->first()->amount);
-              //echo "stateUser.balance: " . $session->read('StateUser.balance');
-            }
-        }
-
+       
+        
         // load error count
         if ($state_user_id) {
             $stateErrorsTable = TableRegistry::getTableLocator()->get('stateErrors');
@@ -111,8 +100,6 @@ class AppController extends Controller
                   ->where(['state_user_id' => $state_user_id]);
             $session->write('StateUser.errorCount', $stateErrorQuery->count());
         }
-        //echo "initialize";
-
 
         // put current page into global for navi
         $GLOBALS["passed"] = null;
@@ -137,17 +124,46 @@ class AppController extends Controller
         } else {
             $this->loginServerUrl = Router::url('/', true);
         }
+        /*
+         * 
+         *    'GradidoBlockchain' => [
+         *      // type:
+         *      //   - mysql: centralized blockchain in mysql db, no cross group transactions
+         *      //   - hedera: send transaction over hedera
+         *    'type' => 'hedera',
+         *      // gradido nodes with blockchain (if type != mysql)
+         *    'nodes' => [
+         *        ['host' => 'http://192.168.178.225', 'port' => 13702]
+         *    ]
+         *  ],
+         */
+        $blockchain = Configure::read('GradidoBlockchain');
+        if($blockchain && isset($blockchain['type'])) {
+            $this->blockchainType = $blockchain['type'];
+        }
     }
 
-    protected function requestLogin($session_id = 0)
+    protected function requestLogin($sessionId = 0, $redirect = true)
     {
+        $stateBalancesTable = TableRegistry::getTableLocator()->get('StateBalances');
         $session = $this->getRequest()->getSession();
         // check login
         // disable encryption for cookies
-        //$this->Cookie->configKey('User', 'encryption', false);
-        if(!$session_id) {
-            $session_id = intval($this->request->getCookie('GRADIDO_LOGIN', ''));
+        $session_id = 0;
+        $php_session_id = 0;
+        if($session->check('session_id')) {
+            $php_session_id = intval($session->read('session_id'));
         }
+        $cookie_session_id = intval($this->request->getCookie('GRADIDO_LOGIN', ''));
+        // decide in which order session_ids are tried
+        if($sessionId != 0) {
+            $session_id = $sessionId;
+        //} else if($php_session_id != 0) {
+            //$session_id = $php_session_id;
+        } else if($cookie_session_id != 0) {
+            $session_id = $cookie_session_id;
+        } 
+
         $ip = $this->request->clientIp();
         if (!$session->check('client_ip')) {
             $session->write('client_ip', $ip);
@@ -158,14 +174,19 @@ class AppController extends Controller
 
         if ($session_id != 0) {
             $userStored = $session->read('StateUser');
+
+            $transactionPendings = $session->read('Transactions.pending');
+            $transactionExecutings = $session->read('Transactions.executing');
+            $transaction_can_signed = $session->read('Transactions.can_signed');
+            
             
 
-            $transactionPendings = $session->read('Transaction.pending');
-            $transactionExecutings = $session->read('Transaction.executing');
             if ($session->read('session_id') != $session_id ||
              ( $userStored && (!isset($userStored['id']) || !$userStored['email_checked'])) ||
               intval($transactionPendings) > 0 ||
-              intval($transactionExecutings) > 0) {
+              intval($transactionExecutings) > 0 ||
+              intval($transaction_can_signed > 0)) 
+              {
                 $http = new Client();
 
                 try {
@@ -182,28 +203,36 @@ class AppController extends Controller
                                 $session->destroy();
                             }
                             foreach ($json['user'] as $key => $value) {
+                                // we don't need the id of user in login server db
+                                if($key  == 'id') continue;
                                 $session->write('StateUser.' . $key, $value);
                             }
                           //var_dump($json);
-                            $transactionPendings = $json['Transaction.pending'];
-                            $transactionExecuting = $json['Transaction.executing'];
+                            $transactionPendings = $json['Transactions.pending'];
+                            $transactionExecuting = $json['Transactions.executing'];
+                            $transaction_can_signed = $json['Transactions.can_signed'];
                           //echo "read transaction pending: $transactionPendings<br>";
-                            $session->write('Transaction.pending', $transactionPendings);
-                            $session->write('Transaction.executing', $transactionExecuting);
+                            $session->write('Transactions.pending', $transactionPendings);
+                            $session->write('Transactions.executing', $transactionExecuting);
+                            $session->write('Transactions.can_signed', $transaction_can_signed);
                             $session->write('session_id', $session_id);
                             $stateUserTable = TableRegistry::getTableLocator()->get('StateUsers');
+                            
 
                             if (isset($json['user']['public_hex']) && $json['user']['public_hex'] != '') {
                                 $public_key_bin = hex2bin($json['user']['public_hex']);
                                 $stateUserQuery = $stateUserTable
                                 ->find('all')
                                 ->where(['public_key' => $public_key_bin])
-                                ->contain(['StateBalances']);
+                                ->contain('StateBalances', function ($q) {
+                                            return $q->order(['record_date' => 'DESC'])
+                                                     ->limit(1);
+                                        });
                                 if ($stateUserQuery->count() == 1) {
                                     $stateUser = $stateUserQuery->first();
                                     if ($stateUser->first_name != $json['user']['first_name'] ||
                                         $stateUser->last_name  != $json['user']['last_name'] ||
-                                        $stateUser->disabled  != intval($json['user']['disabled']) ||
+                                        $stateUser->disabled  != $json['user']['disabled'] ||
                                         //$stateUser->username  != $json['user']['username'] ||
                                         // -> throws error
                                         $stateUser->email      != $json['user']['email']
@@ -216,10 +245,6 @@ class AppController extends Controller
                                         if (!$stateUserTable->save($stateUser)) {
                                             $this->Flash->error(__('error updating state user ' . json_encode($stateUser->errors())));
                                         }
-                                    }
-                                  //var_dump($stateUser);
-                                    if (count($stateUser->state_balances) > 0) {
-                                        $session->write('StateUser.balance', $stateUser->state_balances[0]->amount);
                                     }
                                     $session->write('StateUser.id', $stateUser->id);
                               //echo $stateUser['id'];
@@ -238,31 +263,52 @@ class AppController extends Controller
                                   //echo $newStateUser->id;
                                 }
                             } else {
+                                if(!$redirect) {
+                                    return ['state' => 'error', 'msg' => 'no pubkey'];
+                                }
                           // we haven't get a pubkey? something seems to gone wrong on the login-server
                                 $this->Flash->error(__('no pubkey'));
                           //var_dump($json);
                                 return $this->redirect($this->loginServerUrl . 'account/error500/noPubkey', 303);
                             }
                         } else {
+                            if(!$redirect) {
+                                return ['state' => 'not found', 'msg' => 'invalid session', 'details' => $json];
+                            }
                             if ($json['state'] === 'not found') {
                                 $this->Flash->error(__('invalid session'));
                             } else {
                                 $this->Flash->error(__('Konto ist nicht aktiviert!'));
                             }
                       //die(json_encode($json));
+                            if(preg_match('/client ip/', $json['msg'])) {
+                                return $this->redirect($this->loginServerUrl . 'account/error500/ipError', 303);
+                            }
+
                             return $this->redirect($this->loginServerUrl . 'account/', 303);
                         }
                     }
                 } catch (\Exception $e) {
                     $msg = $e->getMessage();
+                    if(!$redirect) {
+                        return ['state' => 'error', 'msg' => 'login-server http request error', 'details' => $msg];
+                    }
                     $this->Flash->error(__('error http request: ') . $msg);
                     return $this->redirect(['controller' => 'Dashboard', 'action' => 'errorHttpRequest']);
                   //continue;
                 }
             }
+            $state_balance = $stateBalancesTable->find()->where(['state_user_id' => $session->read('StateUser.id')])->first();
+            if ($state_balance) {
+                $now = new FrozenTime;
+                $session->write('StateUser.balance', $stateBalancesTable->calculateDecay($state_balance->amount, $state_balance->record_date, $now));
+            }
         } else {
           // no login
           //die("no login");
+            if(!$redirect) {
+                return ['state' => 'error', 'msg' => 'not logged in'];
+            }
             if (isset($loginServer['path'])) {
                 return $this->redirect($loginServer['path'], 303);
             } else {
